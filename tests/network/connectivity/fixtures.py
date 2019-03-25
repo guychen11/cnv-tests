@@ -18,44 +18,42 @@ def prepare_env(request):
     nodes_network_info = {}
     bond_name = config.BOND_NAME
     bond_bridge = config.BOND_BRIDGE
-    bridge_name_vxlan = config.BRIDGE_NAME_VXLAN
+    bridge_name_vlan_vxlan = config.LINUX_BRIDGE_VLAN_VXLAN
+    bridge_name_novlan_vxlan = config.LINUX_BRIDGE_NOVLAN_VXLAN
     bridge_name_real_nics = config.BRIDGE_NAME_REAL_NICS
-    vxlan_port = config.OVS_NO_VLAN_PORT
     vms = config.VMS_LIST
     active_node_nics = {}
+    mgmt_nic = None
+    ip_link_del = 'ip link del'
+    ip_link_set = 'ip link set'
+    vxlan_name = config.VXLAN_NAME
+    resource = Resource(namespace=config.NETWORK_NS)
 
     def fin():
         """
         Remove test namespaces
         """
-        for pod in config.PRIVILEGED_PODS:
+        privileged_pods = Pod().list(get_names=True, label_selector="app=privileged-test-pod")
+        for pod in privileged_pods:
             pod_object = Pod(name=pod, namespace=config.NETWORK_NS)
             pod_container = pod_object.containers()[0].name
-            for bridge in config.ALL_BRIDGES:
-                pod_object.run_command(command=config.OVS_VSCTL_DEL_BR.format(bridge=bridge), container=pod_container)
-
-            if config.BOND_SUPPORT_ENV:
-                pod_object.run_command(command=config.IP_LINK_DEL_BOND, container=pod_container)
+            for bridge in config.ALL_TO_REMOVE:
+                pod_object.run_command(command=f"{ip_link_del} {bridge}", container=pod_container)
 
         for vm in vms:
             vm_object = VirtualMachine(name=vm, namespace=config.NETWORK_NS)
             if vm_object.get():
                 vm_object.delete(wait=True)
 
-        utils.run_command(command=config.SVC_DELETE_CMD)
-        for yaml_ in (config.PRIVILEGED_DAEMONSET_YAML, config.OVS_VLAN_YAML, config.OVS_BOND_YAML):
-            Resource().delete(yaml_file=yaml_, wait=True)
+        for yaml_ in (config.LINUX_BRIDGE_BOND_YAML, config.LINUX_BRIDGE_VLAN_YAML, config.LINUX_BRIDGE_YAML):
+            resource.delete(yaml_file=yaml_, wait=True)
 
     request.addfinalizer(fin)
 
+    for yaml_ in (config.LINUX_BRIDGE_BOND_YAML, config.LINUX_BRIDGE_VLAN_YAML, config.LINUX_BRIDGE_YAML):
+        resource.create(yaml_file=yaml_, wait=True)
+
     compute_nodes = Node().list(get_names=True, label_selector="node-role.kubernetes.io/compute=true")
-    assert utils.run_command(command=config.SVC_CMD)[0]
-    assert utils.run_command(command=config.ADM_CMD)[0]
-    assert Resource().create(yaml_file=config.PRIVILEGED_DAEMONSET_YAML)
-    wait_for_pods_to_match_compute_nodes_number(number_of_nodes=len(compute_nodes))
-    config.PRIVILEGED_PODS = Pod().list(get_names=True, label_selector="app=privileged-test-pod")
-    assert Resource().create(yaml_file=config.OVS_VLAN_YAML)
-    assert Resource().create(yaml_file=config.OVS_BOND_YAML)
     for node in compute_nodes:
         node_obj = Node(name=node, namespace=config.NETWORK_NS)
         node_info = node_obj.get()
@@ -66,11 +64,11 @@ def prepare_env(request):
 
     #  Check if we running with real NICs (not on VM)
     #  Check the number of the NICs on the node to ser BOND support
-    for idx, pod in enumerate(config.PRIVILEGED_PODS):
+    privileged_pods = Pod().list(get_names=True, label_selector="app=privileged-test-pod")
+    for idx, pod in enumerate(privileged_pods):
         pod_object = Pod(name=pod, namespace=config.NETWORK_NS)
         pod_container = pod_object.containers()[0].name
         active_node_nics[pod] = []
-        assert pod_object.wait_for_status(status=types.RUNNING)
         err, nics = pod_object.run_command(command=config.GET_NICS_CMD, container=pod_container)
         assert err
         nics = nics.splitlines()
@@ -83,10 +81,10 @@ def prepare_env(request):
             assert err
             if nic_state.strip() == "up":
                 if nic in [i for i in default_gw.splitlines() if 'default' in i][0]:
+                    mgmt_nic = nic
                     continue
 
                 active_node_nics[pod].append(nic)
-
                 err, driver = pod_object.run_command(
                     command=config.CHECK_NIC_DRIVER_CMD.format(nic=nic), container=pod_container
                 )
@@ -96,95 +94,70 @@ def prepare_env(request):
         config.BOND_SUPPORT_ENV = len(active_node_nics[pod]) > 3
 
     #  Configure bridges on the nodes
-    for idx, pod in enumerate(config.PRIVILEGED_PODS):
+    for idx, pod in enumerate(privileged_pods):
         pod_object = Pod(name=pod, namespace=config.NETWORK_NS)
         pod_name = pod
-        node_name = pod_object.node()
         pod_container = pod_object.containers()[0].name
         if config.REAL_NICS_ENV:
-            assert pod_object.run_command(
-                command=config.OVS_VSCTL_ADD_BR.format(bridge=bridge_name_real_nics), container=pod_container
-            )[0]
+            interface = active_node_nics[pod_name][0]
+            for cmd in (
+                config.LINUX_BRIDGE_CREATE.format(bridge=bridge_name_real_nics),
+                config.LINUX_BRIDGE_CREATE.format(bridge=bridge_name_novlan_vxlan),
+                config.IP_LINK_INTERFACE_UP.format(interface=bridge_name_real_nics),
+                config.IP_LINK_INTERFACE_UP.format(interface=bridge_name_novlan_vxlan),
+                config.LINUX_BRIDGE_ADD_IF.format(interface=interface, bridge=bridge_name_real_nics),
+                config.LINUX_BRIDGE_ADD_IF.format(interface=interface, bridge=bridge_name_novlan_vxlan),
+                f"ip addr add {config.OVS_NODES_IPS[idx]} dev {bridge_name_novlan_vxlan}"
+            ):
+                assert pod_object.run_command(command=cmd, container=pod_container)[0]
 
-            config.CREATED_BRIDGES.add(bridge_name_real_nics)
-            assert pod_object.run_command(
-                command=config.OVS_VSCTL_ADD_PORT.format(
-                    bridge=bridge_name_real_nics, interface=active_node_nics[pod_name][0]
-                ), container=pod_container
-            )[0]
         else:
-            assert pod_object.run_command(
-                command=config.OVS_VSCTL_ADD_BR.format(bridge=bridge_name_vxlan), container=pod_container
-            )[0]
-            config.CREATED_BRIDGES.add(bridge_name_vxlan)
-            for name, ip in nodes_network_info.items():
-                if name != node_name:
-                    assert pod_object.run_command(
-                        command=config.OVS_VSCTL_ADD_VXLAN.format(bridge=bridge_name_vxlan, ip=ip),
-                        container=pod_container
-                    )[0]
-                    break
-
-            assert pod_object.run_command(
-                command=config.OVS_VSCTL_ADD_PORT_VXLAN.format(
-                    bridge=config.BRIDGE_NAME_VXLAN, port_1=vxlan_port, port_2=vxlan_port
-                ), container=pod_container
-            )[0]
-
-            assert pod_object.run_command(
-                command=config.IP_ADDR_ADD.format(ip=config.OVS_NODES_IPS[idx], dev=vxlan_port),
-                container=pod_container
-            )[0]
+            for cmd in (
+                f"{config.LINUX_BRIDGE_CREATE_VXLAN} {mgmt_nic}",
+                config.LINUX_BRIDGE_CREATE.format(bridge=bridge_name_vlan_vxlan),
+                config.LINUX_BRIDGE_CREATE.format(bridge=bridge_name_novlan_vxlan),
+                config.IP_LINK_INTERFACE_UP.format(interface=bridge_name_vlan_vxlan),
+                config.IP_LINK_INTERFACE_UP.format(interface=bridge_name_novlan_vxlan),
+                config.LINUX_BRIDGE_ADD_IF.format(interface=vxlan_name, bridge=bridge_name_vlan_vxlan),
+                config.LINUX_BRIDGE_ADD_IF.format(interface=vxlan_name, bridge=bridge_name_novlan_vxlan),
+                config.IP_LINK_INTERFACE_UP.format(interface=vxlan_name),
+                f"ip addr add {config.OVS_NODES_IPS[idx]} dev {bridge_name_novlan_vxlan}"
+            ):
+                assert pod_object.run_command(command=cmd, container=pod_container)[0]
 
     #  Configure bridge on BOND if env support BOND
     if config.BOND_SUPPORT_ENV:
-        bond_commands = [config.IP_LINK_ADD_BOND, config.IP_LINK_SET_BOND_PARAMS]
-        for pod in config.PRIVILEGED_PODS:
+        for pod in privileged_pods:
             pod_object = Pod(name=pod, namespace=config.NETWORK_NS)
             pod_name = pod
             pod_container = pod_object.containers()[0].name
-            for cmd in bond_commands:
-                assert pod_object.run_command(command=cmd,container=pod_container)[0]
+            for cmd in [config.IP_LINK_ADD_BOND, config.IP_LINK_SET_BOND_PARAMS]:
+                assert pod_object.run_command(command=cmd, container=pod_container)[0]
 
             for nic in active_node_nics[pod_name][1:3]:
-                assert pod_object.run_command(
-                    command=config.IP_LINK_INTERFACE_DOWN.format(interface=nic), container=pod_container
-                )[0]
+                for cmd in (
+                    f"{ip_link_set} {nic} down",
+                    f"{ip_link_set} {nic} master {bond_name}",
+                    f"{ip_link_set} {nic} up"
+                ):
+                    assert pod_object.run_command(command=cmd, container=pod_container)[0]
 
-                assert pod_object.run_command(
-                    command=config.IP_LINK_SET_INTERFACE_MASTER.format(interface=nic, bond=bond_name),
-                    container=pod_container
-                )[0]
-
-                assert pod_object.run_command(
-                    command=config.IP_LINK_INTERFACE_UP.format(interface=nic), container=pod_container
-                )[0]
-
-            assert pod_object.run_command(
-                command=config.IP_LINK_INTERFACE_UP.format(interface=bond_name), container=pod_container
-            )[0]
-
-            res, out = pod_object.run_command(
-                command=config.IP_LINK_SHOW.format(interface=bond_name), container=pod_container
-            )
-
+            assert pod_object.run_command(command=f"{ip_link_set} {bond_name} up", container=pod_container)[0]
+            res, out = pod_object.run_command(command=f"ip link show {bond_name}", container=pod_container)
             assert res
             assert "state UP" in out
 
-            assert pod_object.run_command(
-                command=config.OVS_VSCTL_ADD_BR.format(bridge=bond_bridge), container=pod_container
-            )[0]
-
-            config.CREATED_BRIDGES.add(bond_bridge)
-            assert pod_object.run_command(
-                command=config.OVS_VSCTL_ADD_PORT.format(bridge=bond_bridge, interface=bond_name),
-                container=pod_container
-            )[0]
+            for cmd in (
+                config.LINUX_BRIDGE_CREATE.format(bridge=bond_bridge),
+                config.IP_LINK_INTERFACE_UP.format(interface=bond_bridge),
+                config.LINUX_BRIDGE_ADD_IF.format(interface=bond_name, bridge=bond_bridge)
+            ):
+                assert pod_object.run_command(command=cmd, container=pod_container)[0]
 
     for vm in vms:
         vm_object = VirtualMachine(name=vm, namespace=config.NETWORK_NS)
         json_out = utils.get_json_from_template(
-            file_=config.VM_YAML_TEMPLATE, NAME=vm, MULTUS_NETWORK="ovs-vlan-net"
+            file_=config.VM_YAML_TEMPLATE, NAME=vm, MULTUS_NETWORK="bridge-vlan-net"
         )
         spec = json_out.get('spec').get('template').get('spec')
         volumes = spec.get('volumes')
@@ -195,7 +168,7 @@ def prepare_env(request):
             "\nruncmd:\n"
             "  - nmcli con add type ethernet con-name eth1 ifname eth1\n"
             "  - nmcli con mod eth1 ipv4.addresses {ip}/24 ipv4.method manual\n"
-            "  - systemctl start qemu-guest-agent\n".format(ip=config.VMS.get(vm).get("ovs_ip"))
+            "  - systemctl start qemu-guest-agent\n".format(ip=config.VMS.get(vm).get("bridge_ip"))
         )
         if not config.REAL_NICS_ENV:
             cloud_init_user_data += "  - ip link set mtu 1450 eth1\n"
@@ -203,8 +176,8 @@ def prepare_env(request):
         if config.BOND_SUPPORT_ENV:
             interfaces = spec.get('domain').get('devices').get('interfaces')
             networks = spec.get('networks')
-            bond_bridge_interface = {'bridge': {}, 'name': 'ovs-net-bond'}
-            bond_bridge_network = {'multus': {'networkName': 'ovs-net-bond'}, 'name': 'ovs-net-bond'}
+            bond_bridge_interface = {'bridge': {}, 'name': 'bridge-net-bond'}
+            bond_bridge_network = {'multus': {'networkName': 'bridge-net-bond'}, 'name': 'bridge-net-bond'}
             interfaces.append(bond_bridge_interface)
             networks.append(bond_bridge_network)
             cloud_init_user_data += (
@@ -254,24 +227,4 @@ def wait_for_vm_interfaces(vmi):
             return True
 
 
-@generate_logs()
-def wait_for_pods_to_match_compute_nodes_number(number_of_nodes):
-    """
-    Wait for pods to be created from DaemonSet
 
-    Args:
-        number_of_nodes (int): Number of nodes to match for.
-
-    Returns:
-        bool: True if Pods created.
-
-    Raises:
-        TimeoutExpiredError: After timeout reached.
-
-    """
-    sampler = utils.TimeoutSampler(
-        timeout=30, sleep=1, func=Pod().list, get_names=True, label_selector="app=privileged-test-pod"
-    )
-    for sample in sampler:
-        if len(sample) == number_of_nodes:
-            return True

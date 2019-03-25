@@ -2,7 +2,7 @@ apiVersion: "k8s.cni.cncf.io/v1"
 kind: NetworkAttachmentDefinition
 metadata:
   name: ovs-vlan-net
-  namespace: cnv-network-ns
+  namespace: network-tests-namespace
 spec:
   config: '{
       "cniVersion": "0.3.1",
